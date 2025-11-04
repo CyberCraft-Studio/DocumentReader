@@ -1,0 +1,20 @@
+<resources>
+    <string name="app_name">Document Reader</string>
+    <string name="select_document">Select a document to read</string>
+    <string name="open_document">Open Document</string>
+    <string name="loading">Loading…</string>
+    <string name="content_placeholder">Document content will appear here…</string>
+    <string name="permission_granted">Permission granted</string>
+    <string name="permission_denied">Permission denied. Some features may not work.</string>
+    <string name="document_loaded">Document loaded</string>
+    <string name="loading_error">Loading error</string>
+    <string name="install_file_manager">Please install a file manager</string>
+    <string name="document_viewer">Document Viewer</string>
+    <string name="choose_file">Choose file to view</string>
+    <string name="features">Features:</string>
+    <string name="feature_formatting">✓ Text formatting (bold, italic)</string>
+    <string name="feature_images">✓ Images from documents</string>
+    <string name="feature_tables">✓ Tables with styles</string>
+    <string name="feature_pdf">✓ PDF as images</string>
+    <string name="feature_zoom">✓ Document zoom</string>
+</resources>

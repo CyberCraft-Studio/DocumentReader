@@ -1,0 +1,51 @@
+# EditorConfig для DocumentReader
+# https://editorconfig.org
+
+root = true
+
+# Загальні налаштування для всіх файлів
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+
+# Java файли
+[*.java]
+indent_size = 4
+max_line_length = 120
+continuation_indent_size = 8
+
+# Kotlin файли (на майбутнє)
+[*.kt]
+indent_size = 4
+max_line_length = 120
+
+# XML файли (layout, manifest, тощо)
+[*.xml]
+indent_size = 4
+max_line_length = 160
+
+# Gradle файли
+[*.gradle]
+indent_size = 4
+
+# Markdown
+[*.md]
+indent_size = 2
+trim_trailing_whitespace = false
+max_line_length = 80
+
+# YAML
+[*.{yml,yaml}]
+indent_size = 2
+
+# JSON
+[*.json]
+indent_size = 2
+
+# Properties файли
+[*.properties]
+indent_size = 4
+

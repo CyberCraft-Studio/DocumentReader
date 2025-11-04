@@ -1,0 +1,79 @@
+plugins {
+    alias(libs.plugins.android.application)
+}
+
+android {
+    namespace 'com.ccs.documentreader'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.ccs.documentreader"
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+    
+    packagingOptions {
+        resources {
+            excludes += ['META-INF/NOTICE', 'META-INF/LICENSE', 'META-INF/DEPENDENCIES']
+        }
+    }
+}
+
+dependencies {
+
+    implementation libs.appcompat
+    implementation libs.material
+    implementation libs.activity
+    implementation libs.constraintlayout
+    
+    // Apache POI для Word, Excel, PowerPoint
+    implementation 'org.apache.poi:poi:5.2.3'
+    implementation 'org.apache.poi:poi-ooxml:5.2.3'
+    implementation 'org.apache.poi:poi-scratchpad:5.2.3'
+    
+    // PDF читання
+    implementation 'com.tom-roush:pdfbox-android:2.0.27.0'
+    
+    // Markdown
+    implementation 'io.noties.markwon:core:4.6.2'
+    
+    // JSON парсинг
+    implementation 'com.google.code.gson:gson:2.10.1'
+    
+    // XML парсинг
+    implementation 'org.simpleframework:simple-xml:2.7.1'
+    
+    // EPUB читання - тимчасово вимкнено через недоступність в Maven Central
+    // implementation 'nl.siegmann.epublib:epublib-core:3.1'
+    
+    // Архіви (ZIP, RAR тощо)
+    implementation 'org.apache.commons:commons-compress:1.24.0'
+    
+    // RTF підтримка
+    implementation 'com.github.joniles:rtfparserkit:1.16.0'
+    
+    // CSV підтримка
+    implementation 'com.opencsv:opencsv:5.8'
+    
+    // YAML підтримка
+    implementation 'org.yaml:snakeyaml:2.2'
+    
+    testImplementation libs.junit
+    androidTestImplementation libs.ext.junit
+    androidTestImplementation libs.espresso.core
+}
