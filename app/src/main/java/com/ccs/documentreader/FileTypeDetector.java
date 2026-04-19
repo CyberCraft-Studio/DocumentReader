@@ -26,6 +26,7 @@ public class FileTypeDetector {
         // Документи
         extensionToCategory.put("doc", FileCategory.DOCUMENT);
         extensionToCategory.put("docx", FileCategory.DOCUMENT);
+        extensionToCategory.put("docs", FileCategory.DOCUMENT);
         extensionToCategory.put("docm", FileCategory.DOCUMENT);
         extensionToCategory.put("odt", FileCategory.DOCUMENT);
         extensionToCategory.put("rtf", FileCategory.DOCUMENT);
@@ -45,6 +46,7 @@ public class FileTypeDetector {
         // Презентації
         extensionToCategory.put("ppt", FileCategory.PRESENTATION);
         extensionToCategory.put("pptx", FileCategory.PRESENTATION);
+        extensionToCategory.put("pptm", FileCategory.PRESENTATION);
         extensionToCategory.put("odp", FileCategory.PRESENTATION);
         extensionToCategory.put("key", FileCategory.PRESENTATION);
 
@@ -79,6 +81,7 @@ public class FileTypeDetector {
         extensionToCategory.put("md", FileCategory.TEXT);
         extensionToCategory.put("tex", FileCategory.TEXT);
         extensionToCategory.put("rmd", FileCategory.TEXT);
+        extensionToCategory.put("java", FileCategory.TEXT);
     }
 
     /**

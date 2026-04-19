@@ -1,969 +1,1105 @@
 package com.ccs.documentreader;
 
 import android.content.Context;
-import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
+import android.database.Cursor;
 import android.net.Uri;
+import android.provider.OpenableColumns;
 import android.util.Base64;
 import android.util.Log;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonParser;
+import com.opencsv.CSVReader;
 
+import org.apache.poi.hssf.usermodel.HSSFWorkbook;
 import org.apache.poi.hwpf.HWPFDocument;
-import org.apache.poi.hwpf.usermodel.CharacterRun;
 import org.apache.poi.hwpf.usermodel.Paragraph;
-import org.apache.poi.hwpf.usermodel.Picture;
 import org.apache.poi.hwpf.usermodel.Range;
-import org.apache.poi.xwpf.usermodel.*;
+import org.apache.poi.ss.usermodel.Cell;
+import org.apache.poi.ss.usermodel.CellType;
+import org.apache.poi.ss.usermodel.DateUtil;
+import org.apache.poi.ss.usermodel.Row;
+import org.apache.poi.ss.usermodel.Sheet;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+import org.apache.poi.xwpf.usermodel.IBodyElement;
+import org.apache.poi.xwpf.usermodel.ParagraphAlignment;
+import org.apache.poi.xwpf.usermodel.UnderlinePatterns;
+import org.apache.poi.xwpf.usermodel.XWPFDocument;
+import org.apache.poi.xwpf.usermodel.XWPFParagraph;
 import org.apache.poi.xwpf.usermodel.XWPFPicture;
 import org.apache.poi.xwpf.usermodel.XWPFPictureData;
-import org.apache.poi.xssf.usermodel.XSSFWorkbook;
-import org.apache.poi.ss.usermodel.*;
-import org.apache.poi.hssf.usermodel.HSSFWorkbook;
-
-import com.tom_roush.pdfbox.android.PDFBoxResourceLoader;
-import com.tom_roush.pdfbox.pdmodel.PDDocument;
-import com.tom_roush.pdfbox.pdmodel.PDPage;
-import com.tom_roush.pdfbox.rendering.PDFRenderer;
-import com.tom_roush.pdfbox.text.PDFTextStripper;
+import org.apache.poi.xwpf.usermodel.XWPFRun;
+import org.apache.poi.xwpf.usermodel.XWPFSDT;
+import org.apache.poi.xwpf.usermodel.XWPFTable;
+import org.apache.poi.xwpf.usermodel.XWPFTableCell;
+import org.apache.poi.xwpf.usermodel.XWPFTableRow;
+import org.commonmark.Extension;
+import org.commonmark.ext.gfm.strikethrough.StrikethroughExtension;
+import org.commonmark.ext.gfm.tables.TablesExtension;
+import org.commonmark.ext.task.list.items.TaskListItemsExtension;
+import org.commonmark.parser.Parser;
+import org.commonmark.renderer.html.HtmlRenderer;
+import org.yaml.snakeyaml.Yaml;
 
 import java.io.BufferedReader;
-import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 
 /**
- * Покращений читач документів з підтримкою форматування та зображень
- * Генерує HTML для відображення в WebView
+ * Універсальний "rich" читач документів. Генерує HTML для відображення в WebView.
+ *
+ * Принципи:
+ *   • НЕ робити подвійної роботи (жодних "тестових" парсингів у проді)
+ *   • Завжди закривати потоки
+ *   • Безпечно екранувати HTML (без поломки UTF-8)
+ *   • Формати, де доречно — мати власні стилі (Excel-таблиці, EPUB-розділи, …)
  */
 public class RichDocumentReader {
     private static final String TAG = "RichDocumentReader";
-    private Context context;
+
+    /** Розмір одного блоку при потоковому перегляді великих текстових файлів. */
+    public static final int STREAM_CHUNK_BYTES = 1024 * 1024;
+    /** Скільки блоків (~МБ) тримати в DOM WebView; старі видаляються при прокрутці вниз. */
+    public static final int STREAM_MAX_DOM_CHUNKS = 12;
+    /** Від цього розміру (або якщо розмір невідомий) — увімкнути потоковий режим. */
+    public static final long STREAM_THRESHOLD_BYTES = 512 * 1024;
+
+    /**
+     * Для structured JSON/YAML: якщо більше — не будуємо AST, показуємо як текст
+     * (або потоково через {@link DocumentViewerActivity}).
+     */
+    private static final int MAX_STRUCTURED_TEXT_BYTES = 6 * 1024 * 1024;
+
+    private final Context context;
 
     public RichDocumentReader(Context context) {
         this.context = context;
-        PDFBoxResourceLoader.init(context);
+    }
+
+    /** Чи варто відкривати файл як потоковий текст (чанки по 1 МБ) у {@link DocumentViewerActivity}. */
+    public static boolean shouldStreamAsPlainText(String extension, long sizeBytes) {
+        String ext = extension == null ? "" : extension.toLowerCase(Locale.ROOT);
+        if (!isStreamablePlainTextExtension(ext)) return false;
+        return sizeBytes < 0 || sizeBytes >= STREAM_THRESHOLD_BYTES;
+    }
+
+    public static boolean isStreamablePlainTextExtension(String ext) {
+        if (ext == null) return false;
+        switch (ext.toLowerCase(Locale.ROOT)) {
+            case "txt":
+            case "log":
+            case "md":
+            case "markdown":
+            case "rmd":
+            case "json":
+            case "yaml":
+            case "yml":
+            case "xml":
+            case "svg":
+            case "csv":
+            case "tsv":
+            case "tex":
+            case "bib":
+            case "ini":
+            case "conf":
+            case "properties":
+            case "rtf":
+            case "html":
+            case "htm":
+            case "java":
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    public static long queryOpenableSize(Context ctx, Uri uri) {
+        try (Cursor c = ctx.getContentResolver()
+                .query(uri, new String[]{OpenableColumns.SIZE}, null, null, null)) {
+            if (c != null && c.moveToFirst()) {
+                int idx = c.getColumnIndex(OpenableColumns.SIZE);
+                if (idx >= 0 && !c.isNull(idx)) return c.getLong(idx);
+            }
+        } catch (Exception ignored) {}
+        return -1L;
+    }
+
+    /**
+     * Порожня оболонка HTML для потокового перегляду: перший блок додається через JS
+     * після {@code onPageFinished}.
+     */
+    public static String buildStreamViewerHtml(String fileName, long knownSizeBytes, boolean javaSyntax) {
+        String sizeLine;
+        if (knownSizeBytes >= 0) {
+            sizeLine = "Розмір файлу: " + (knownSizeBytes / 1024L) + " КБ";
+        } else {
+            sizeLine = "Розмір файлу: невідомий (потокове читання)";
+        }
+        String preClass = javaSyntax ? "text-content java-src" : "text-content";
+        String javaNote = javaSyntax
+            ? "<br/><small>Підсвітка синтаксису Java по фрагментах; на межах 1 МБ кольори можуть зміщуватися.</small>"
+            : "";
+        return "<!DOCTYPE html><html><head>" +
+            "<meta charset='UTF-8'>" +
+            "<meta name='viewport' content='width=device-width, initial-scale=1.0, user-scalable=yes'>" +
+            "<title>" + escapeStatic(fileName == null ? "" : fileName) + "</title>" +
+            "<style>" + getDocumentCss() + "</style>" +
+            "</head><body class='theme-light'>" +
+            "<main class='container'>" +
+            "<div class='info' id='streamHead'>" + escapeStatic(sizeLine) +
+            "<br/><small>Підвантаження по 1 МБ при прокрутці вниз. У пам'яті WebView зберігається лише останні ~" +
+            STREAM_MAX_DOM_CHUNKS + " МБ — початок файлу може вивантажуватися з екрана.</small>" +
+            javaNote + "</div>" +
+            "<pre id='streamPre' class='" + preClass + "'></pre>" +
+            "<div class='info' id='streamFoot'></div>" +
+            "<script>" +
+            "window.__streamEof=false;" +
+            "window.__streamLoading=false;" +
+            "window.__firstDomChunk=0;" +
+            "window.__appendChunk=function(id,txt,asHtml){" +
+            "var pre=document.getElementById('streamPre');" +
+            "var s=document.createElement('span');" +
+            "s.id='sch'+id;" +
+            "s.className='stream-ch';" +
+            "if(asHtml)s.innerHTML=txt;else s.textContent=txt;" +
+            "pre.appendChild(s);" +
+            "};" +
+            "window.__evictChunk=function(id){" +
+            "var e=document.getElementById('sch'+id);" +
+            "if(e)e.remove();" +
+            "};" +
+            "window.__setFoot=function(t){document.getElementById('streamFoot').textContent=t;};" +
+            "window.addEventListener('scroll',function(){" +
+            "if(window.__streamLoading||window.__streamEof)return;" +
+            "var st=window.scrollY||document.documentElement.scrollTop;" +
+            "var sh=document.documentElement.scrollHeight;" +
+            "var vh=window.innerHeight;" +
+            "if(st+vh>=sh-1200){window.__streamLoading=true;StreamBridge.requestMore();}" +
+            "},{passive:true});" +
+            "window.__tryAutoFill=function(){" +
+            "if(window.__streamLoading||window.__streamEof)return;" +
+            "var sh=document.documentElement.scrollHeight;" +
+            "var vh=window.innerHeight;" +
+            "if(sh<=vh+200){window.__streamLoading=true;StreamBridge.requestMore();}" +
+            "};" +
+            "</script>" +
+            "</main></body></html>";
+    }
+
+    private static String escapeStatic(String text) {
+        if (text == null) return "";
+        StringBuilder out = new StringBuilder(text.length() + 16);
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            switch (c) {
+                case '<':  out.append("&lt;");   break;
+                case '>':  out.append("&gt;");   break;
+                case '&':  out.append("&amp;");  break;
+                case '"':  out.append("&quot;"); break;
+                default:   out.append(c);
+            }
+        }
+        return out.toString();
     }
 
     public String readDocumentAsHtml(Uri uri, String fileName) {
-        String extension = getFileExtension(fileName).toLowerCase();
-        
-        Log.d(TAG, "========================================");
-        Log.d(TAG, "Читання файлу: " + fileName);
-        Log.d(TAG, "Розширення: " + extension);
-        Log.d(TAG, "URI: " + uri.toString());
-        Log.d(TAG, "========================================");
-        
+        String extension = getFileExtension(fileName).toLowerCase(Locale.ROOT);
+        long t0 = System.currentTimeMillis();
+
         try {
-            String htmlContent;
+            String content;
             switch (extension) {
                 case "docx":
                 case "docm":
-                    Log.d(TAG, ">>> Викликаємо readDocxAsHtml");
-                    
-                    // ДІАГНОСТИКА: Запускаємо тестовий читач
-                    String testResult = DocxTestReader.testReadDocx(context, uri);
-                    Log.d(TAG, "TEST RESULT:\n" + testResult);
-                    
-                    htmlContent = readDocxAsHtml(uri);
-                    Log.d(TAG, ">>> HTML довжина: " + htmlContent.length());
-                    
-                    // Якщо HTML містить сирі байти, показуємо тест
-                    if (htmlContent.contains("��") || htmlContent.length() < 100) {
-                        htmlContent = "<pre>" + testResult + "</pre>" + htmlContent;
-                    }
+                    content = readDocxAsHtml(uri);
                     break;
-                    
                 case "doc":
-                    Log.d(TAG, ">>> Викликаємо readDocAsHtml (старий формат)");
-                    htmlContent = readDocAsHtml(uri);
-                    Log.d(TAG, ">>> DOC HTML довжина: " + htmlContent.length());
+                    content = readDocAsHtml(uri);
                     break;
-                    
-                case "pdf":
-                    htmlContent = readPdfAsHtml(uri);
+                case "docs":
+                    content = readWordFlexible(uri);
                     break;
-                    
+
                 case "xlsx":
                 case "xlsm":
-                    htmlContent = readXlsxAsHtml(uri);
+                    content = readXlsxAsHtml(uri);
                     break;
-                    
                 case "xls":
-                    htmlContent = readXlsAsHtml(uri);
+                    content = readXlsAsHtml(uri);
                     break;
-                    
-                case "txt":
-                case "md":
-                    htmlContent = readTextAsHtml(uri);
-                    break;
-                    
-                case "json":
-                    htmlContent = readJsonAsHtml(uri);
-                    break;
-                    
-                case "xml":
-                    htmlContent = readXmlAsHtml(uri);
-                    break;
-                    
+
                 case "pptx":
-                    Log.d(TAG, ">>> Викликаємо readPptxAsHtml");
-                    htmlContent = readPptxAsHtml(uri);
-                    Log.d(TAG, ">>> PPTX HTML довжина: " + htmlContent.length());
+                case "pptm":
+                    content = readPptxAsHtml(uri);
                     break;
-                    
                 case "ppt":
-                    Log.d(TAG, ">>> Викликаємо readPptAsHtml");
-                    htmlContent = readPptAsHtml(uri);
+                    content = readPptAsHtml(uri);
                     break;
-                    
+
+                case "epub":
+                    throw new UnsupportedOperationException(
+                        "EPUB: використовуйте потоковий перегляд у DocumentViewerActivity");
+
+                case "md":
+                case "markdown":
+                case "rmd":
+                    content = readMarkdownAsHtml(uri);
+                    break;
+
+                case "csv":
+                    content = readCsvAsHtml(uri, ',');
+                    break;
+                case "tsv":
+                    content = readCsvAsHtml(uri, '\t');
+                    break;
+
+                case "json":
+                    content = readJsonAsHtml(uri);
+                    break;
+
+                case "yaml":
+                case "yml":
+                    content = readYamlAsHtml(uri);
+                    break;
+
+                case "xml":
+                case "svg":
+                    content = readXmlAsHtml(uri);
+                    break;
+
+                case "html":
+                case "htm":
+                    content = readHtmlPassthrough(uri);
+                    break;
+
+                case "java":
+                    content = readJavaAsHtml(uri);
+                    break;
+
+                case "rtf":
+                case "txt":
+                case "tex":
+                case "bib":
+                case "ini":
+                case "ris":
+                case "enw":
+                case "log":
+                case "conf":
+                case "properties":
+                    content = readTextAsHtml(uri);
+                    break;
+
                 default:
-                    htmlContent = "<div class='info'>Для формату " + extension + 
-                                " використовується базове відображення</div>" +
-                                "<pre>" + readPlainText(uri) + "</pre>";
+                    content = readTextAsHtml(uri);
+                    break;
             }
-            
-            return wrapHtml(htmlContent, fileName);
-            
-        } catch (Exception e) {
-            Log.e(TAG, "Помилка читання файлу: " + fileName, e);
+
+            Log.d(TAG, "Rendered " + fileName + " in " + (System.currentTimeMillis() - t0) + " ms");
+            return wrapHtml(content, fileName);
+
+        } catch (OutOfMemoryError oom) {
+            Log.e(TAG, "OOM rendering " + fileName, oom);
+            // Намагаємося звільнити пам'ять і повернути дружнє повідомлення
+            //noinspection CallToSystemGC
+            System.gc();
+            long size = querySize(uri);
+            String sizeStr = size > 0 ? (size / 1024 / 1024) + " МБ" : "невідомий";
             return wrapHtml(
                 "<div class='error'>" +
-                "<h2>❌ Помилка</h2>" +
-                "<p>Не вдалося прочитати документ</p>" +
-                "<p class='error-detail'>" + e.getMessage() + "</p>" +
+                    "<h2>Файл занадто великий для перегляду</h2>" +
+                    "<p>Розмір: " + sizeStr + ". Спробуйте зменшений варіант або відкрийте файл у спеціалізованому застосунку.</p>" +
+                "</div>", fileName);
+        } catch (Exception e) {
+            Log.e(TAG, "Read failed: " + fileName, e);
+            return wrapHtml(
+                "<div class='error'>" +
+                    "<h2>Не вдалося відкрити документ</h2>" +
+                    "<p>" + escape(e.getMessage()) + "</p>" +
                 "</div>", fileName);
         }
     }
 
-    /**
-     * Читання DOCX з форматуванням та зображеннями
-     */
-    private String readDocxAsHtml(Uri uri) throws Exception {
-        StringBuilder html = new StringBuilder();
-        
-        Log.d(TAG, "Читання DOCX файлу...");
-        
-        // Перевірка валідності файлу
-        if (!FileValidator.isValidDocx(context, uri)) {
-            Log.e(TAG, "File is not valid DOCX!");
-            return "<div class='error'>" +
-                   "<h2>❌ Format Error</h2>" +
-                   "<p>File is not a valid DOCX document</p>" +
-                   "<p>Possible reasons:</p>" +
-                   "<ul>" +
-                   "<li>File is corrupted</li>" +
-                   "<li>Wrong file extension</li>" +
-                   "<li>File is password protected</li>" +
-                   "</ul>" +
-                   "</div>";
-        }
-        
-        InputStream inputStream = null;
-        XWPFDocument document = null;
-        
-        try {
-            inputStream = context.getContentResolver().openInputStream(uri);
-            if (inputStream == null) {
-                throw new Exception("Не вдалося відкрити файл");
-            }
-            
-            Log.d(TAG, "InputStream створено, відкриваємо документ...");
-            document = new XWPFDocument(inputStream);
-            Log.d(TAG, "Документ відкрито успішно! Параграфів: " + document.getParagraphs().size());
-            
-            // Перевірка чи документ порожній
-            if (document.getParagraphs().isEmpty() && document.getTables().isEmpty()) {
-                return "<div class='error'>Документ порожній або пошкоджений</div>";
-            }
-            
-            // Параграфи з вбудованими зображеннями
-            for (XWPFParagraph paragraph : document.getParagraphs()) {
-                html.append(paragraphToHtml(paragraph, document));
-            }
-            
-            // Таблиці
-            for (XWPFTable table : document.getTables()) {
-                html.append(tableToHtml(table));
-            }
-            
-            // Всі зображення в кінці (якщо не вбудовані)
-            List<XWPFPictureData> pictures = document.getAllPictures();
-            if (!pictures.isEmpty()) {
-                html.append("<div class='images-section'>");
-                html.append("<h3>📷 Зображення з документа (").append(pictures.size()).append(")</h3>");
-                for (int i = 0; i < pictures.size(); i++) {
-                    try {
-                        XWPFPictureData picture = pictures.get(i);
-                        byte[] imageData = picture.getData();
-                        if (imageData != null && imageData.length > 0) {
-                            String base64 = encodeImageToBase64(imageData);
-                            String mimeType = picture.getPackagePart().getContentType();
-                            html.append("<div class='image-container'>");
-                            html.append("<p class='image-caption'>Зображення ").append(i + 1).append("</p>");
-                            html.append("<img src='data:").append(mimeType)
-                                .append(";base64,").append(base64).append("' class='doc-image' alt='Image ").append(i + 1).append("'/>");
-                            html.append("</div>");
-                        }
-                    } catch (Exception e) {
-                        Log.e(TAG, "Помилка завантаження зображення " + i, e);
-                        html.append("<p class='error'>Не вдалося завантажити зображення ").append(i + 1).append("</p>");
-                    }
-                }
-                html.append("</div>");
-            }
-            
-            return html.toString();
-            
-        } catch (Exception e) {
-            Log.e(TAG, "Помилка читання DOCX", e);
-            throw new Exception("Не вдалося прочитати DOCX файл: " + e.getMessage());
-        } finally {
-            try {
-                if (document != null) document.close();
-                if (inputStream != null) inputStream.close();
-            } catch (Exception e) {
-                Log.e(TAG, "Помилка закриття ресурсів", e);
-            }
-        }
+    /** Розширення .docs або невідоме ім'я: спроба DOCX (ZIP), інакше DOC (OLE). */
+    private String readWordFlexible(Uri uri) throws Exception {
+        if (FileValidator.isValidDocx(context, uri)) return readDocxAsHtml(uri);
+        if (FileValidator.isValidDoc(context, uri)) return readDocAsHtml(uri);
+        throw new IllegalStateException("Очікується DOC або DOCX (перевірте файл)");
     }
 
-    /**
-     * Конвертація параграфа DOCX в HTML (з підтримкою зображень)
-     */
-    private String paragraphToHtml(XWPFParagraph paragraph, XWPFDocument document) {
-        // Перевірка на вбудовані зображення в runs
-        StringBuilder images = new StringBuilder();
-        for (XWPFRun run : paragraph.getRuns()) {
-            List<XWPFPicture> embeddedPictures = run.getEmbeddedPictures();
-            if (!embeddedPictures.isEmpty()) {
-                for (XWPFPicture picture : embeddedPictures) {
-                    try {
-                        XWPFPictureData pictureData = picture.getPictureData();
-                        byte[] imageData = pictureData.getData();
-                        if (imageData != null && imageData.length > 0) {
-                            String base64 = encodeImageToBase64(imageData);
-                            String mimeType = pictureData.getPackagePart().getContentType();
-                            images.append("<img src='data:").append(mimeType)
-                                .append(";base64,").append(base64)
-                                .append("' class='doc-image inline-image'/>");
-                        }
-                    } catch (Exception e) {
-                        Log.e(TAG, "Помилка вбудованого зображення", e);
-                    }
-                }
-            }
+    // =========================== DOCX ===========================
+
+    private String readDocxAsHtml(Uri uri) throws Exception {
+        if (!FileValidator.isValidDocx(context, uri)) {
+            throw new IllegalStateException("Файл не є валідним DOCX (немає ZIP-сигнатури)");
         }
-        
-        String textHtml = paragraphToHtmlSimple(paragraph);
-        
-        // Додати зображення після параграфа
-        return textHtml + images.toString();
-    }
-    
-    /**
-     * Конвертація параграфа без зображень
-     */
-    private String paragraphToHtmlSimple(XWPFParagraph paragraph) {
-        if (paragraph.getText().trim().isEmpty()) {
-            return "<br/>";
-        }
-        
         StringBuilder html = new StringBuilder();
-        String alignment = getAlignment(paragraph.getAlignment());
-        
-        // Визначення стилю параграфа
-        String style = paragraph.getStyle();
-        boolean isHeading = style != null && style.toLowerCase().contains("heading");
-        
-        if (isHeading) {
-            int level = extractHeadingLevel(style);
-            html.append("<h").append(level).append(" style='text-align:").append(alignment).append("'>");
-        } else {
-            html.append("<p style='text-align:").append(alignment).append("'>");
+        try (InputStream is = context.getContentResolver().openInputStream(uri);
+             XWPFDocument doc = new XWPFDocument(is)) {
+
+            html.append("<article class='reader-doc reader-word'>");
+            html.append("<header class='reader-banner'><span class='reader-banner-label'>")
+                .append("Microsoft Word").append("</span></header>");
+            html.append("<div class='doc-body'>");
+
+            int[] listMode = new int[1];
+            for (IBodyElement el : doc.getBodyElements()) {
+                appendDocxBodyElement(html, el, listMode);
+            }
+            closeDocxList(html, listMode);
+
+            html.append("</div></article>");
         }
-        
-        // Обробка runs (форматованих частин тексту)
-        for (XWPFRun run : paragraph.getRuns()) {
-            html.append(runToHtml(run));
-        }
-        
-        if (isHeading) {
-            int level = extractHeadingLevel(style);
-            html.append("</h").append(level).append(">");
-        } else {
-            html.append("</p>");
-        }
-        
         return html.toString();
     }
 
-    /**
-     * Конвертація run (форматованої частини) в HTML
-     */
-    private String runToHtml(XWPFRun run) {
-        // Пропустити run якщо він містить тільки зображення
-        if (!run.getEmbeddedPictures().isEmpty() && run.getText(0) == null) {
-            return ""; // Зображення обробляються окремо
+    private void closeDocxList(StringBuilder html, int[] listMode) {
+        if (listMode[0] == 1) {
+            html.append("</ul>");
+        } else if (listMode[0] == 2) {
+            html.append("</ol>");
         }
-        
+        listMode[0] = 0;
+    }
+
+    private void appendDocxBodyElement(StringBuilder html, IBodyElement el, int[] listMode) {
+        if (el instanceof XWPFTable) {
+            closeDocxList(html, listMode);
+            html.append(tableToHtml((XWPFTable) el));
+            return;
+        }
+        if (el instanceof XWPFSDT) {
+            closeDocxList(html, listMode);
+            XWPFSDT sdt = (XWPFSDT) el;
+            try {
+                String t = sdt.getContent().getText();
+                if (t != null && !t.trim().isEmpty()) {
+                    html.append("<div class='doc-sdt'>");
+                    for (String line : t.split("\n")) {
+                        String L = line.trim();
+                        if (!L.isEmpty()) {
+                            html.append("<p>").append(escape(L)).append("</p>");
+                        }
+                    }
+                    html.append("</div>");
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "SDT: " + e.getMessage());
+            }
+            return;
+        }
+        if (!(el instanceof XWPFParagraph)) {
+            return;
+        }
+        XWPFParagraph p = (XWPFParagraph) el;
+        BigInteger numId = p.getNumID();
+        if (numId != null) {
+            boolean ordered = isOrderedListFormat(p.getNumFmt());
+            int want = ordered ? 2 : 1;
+            if (listMode[0] == 0) {
+                html.append(ordered ? "<ol class='doc-list'>" : "<ul class='doc-list'>");
+                listMode[0] = want;
+            } else if (listMode[0] != want) {
+                html.append(listMode[0] == 1 ? "</ul>" : "</ol>");
+                html.append(ordered ? "<ol class='doc-list'>" : "<ul class='doc-list'>");
+                listMode[0] = want;
+            }
+            double ind = listIndentEm(p);
+            String inner = paragraphInnerHtml(p);
+            html.append("<li class='doc-li' style='margin-inline-start:").append(ind).append("em'>");
+            if (inner.trim().isEmpty()) {
+                html.append("&nbsp;");
+            } else {
+                html.append(inner);
+            }
+            html.append("</li>");
+            return;
+        }
+        closeDocxList(html, listMode);
+        html.append(paragraphToHtml(p));
+    }
+
+    private static boolean isOrderedListFormat(String fmt) {
+        if (fmt == null || fmt.isEmpty()) {
+            return false;
+        }
+        String f = fmt.toLowerCase(Locale.ROOT);
+        if ("bullet".equals(f) || "none".equals(f)) {
+            return false;
+        }
+        return true;
+    }
+
+    private static double listIndentEm(XWPFParagraph p) {
+        try {
+            BigInteger ilvl = p.getNumIlvl();
+            if (ilvl == null) {
+                return 0;
+            }
+            return Math.max(0, ilvl.intValue()) * 1.15;
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    private String paragraphInnerHtml(XWPFParagraph p) {
+        StringBuilder out = new StringBuilder();
+        for (XWPFRun r : p.getRuns()) {
+            out.append(runToHtml(r));
+        }
+        StringBuilder inlineImgs = new StringBuilder();
+        for (XWPFRun r : p.getRuns()) {
+            for (XWPFPicture pic : r.getEmbeddedPictures()) {
+                try {
+                    XWPFPictureData pd = pic.getPictureData();
+                    byte[] bytes = pd.getData();
+                    if (bytes == null || bytes.length == 0) continue;
+                    String mime = pd.getPackagePart().getContentType();
+                    inlineImgs.append("<img class='doc-image inline-image' src='data:")
+                        .append(mime).append(";base64,")
+                        .append(Base64.encodeToString(bytes, Base64.NO_WRAP))
+                        .append("'/>");
+                } catch (Exception ignored) {}
+            }
+        }
+        out.append(inlineImgs);
+        return out.toString();
+    }
+
+    private String paragraphToHtml(XWPFParagraph p) {
+        String inner = paragraphInnerHtml(p);
+        String text = p.getText();
+        if ((text == null || text.trim().isEmpty()) && inner.trim().isEmpty()) {
+            return "<br class='doc-br'/>";
+        }
+
+        String align = alignment(p.getAlignment());
+        String style = p.getStyle();
+        String sl = style != null ? style.toLowerCase(Locale.ROOT) : "";
+        boolean heading = sl.contains("heading")
+            || (sl.contains("title") && !sl.contains("subtitle"));
+        int level = heading ? extractHeadingLevel(style) : 0;
+
+        StringBuilder out = new StringBuilder();
+        if (heading && level >= 1 && level <= 6) {
+            out.append("<h").append(level).append(" class='doc-heading' style='text-align:")
+                .append(align).append(";'>").append(inner).append("</h").append(level).append('>');
+        } else {
+            out.append("<p class='doc-p' style='text-align:").append(align).append(";'>")
+                .append(inner).append("</p>");
+        }
+        return out.toString();
+    }
+
+    private String runToHtml(XWPFRun run) {
+        if (!run.getEmbeddedPictures().isEmpty() && run.getText(0) == null) return "";
+
         String text = run.getText(0);
         if (text == null || text.isEmpty()) return "";
-        
-        // Для POI тексту НЕ використовуємо escapeHtml - це псує UTF-8
-        // Замість цього екрануємо тільки якщо є небезпечні символи
-        if (text.contains("<") || text.contains(">") || text.contains("&")) {
-            text = escapeHtmlSafe(text);
-        }
-        // Інакше залишаємо текст як є
-        
-        StringBuilder html = new StringBuilder();
-        boolean needsSpan = false;
-        StringBuilder styleAttr = new StringBuilder();
-        
-        // Жирний
-        if (run.isBold()) {
-            html.append("<strong>");
-        }
-        
-        // Курсив
-        if (run.isItalic()) {
-            html.append("<em>");
-        }
-        
-        // Підкреслений
+        text = escape(text);
+
+        StringBuilder open = new StringBuilder();
+        StringBuilder close = new StringBuilder();
+        if (run.isBold()) { open.append("<strong>"); close.insert(0, "</strong>"); }
+        if (run.isItalic()) { open.append("<em>"); close.insert(0, "</em>"); }
         if (run.getUnderline() != UnderlinePatterns.NONE) {
-            html.append("<u>");
+            open.append("<u>"); close.insert(0, "</u>");
         }
-        
-        // Закреслений
-        if (run.isStrikeThrough()) {
-            html.append("<s>");
-        }
-        
-        // Колір тексту
+        if (run.isStrikeThrough()) { open.append("<s>"); close.insert(0, "</s>"); }
+
+        StringBuilder span = new StringBuilder();
         String color = run.getColor();
-        if (color != null && !color.equals("auto")) {
-            styleAttr.append("color:#").append(color).append(";");
-            needsSpan = true;
+        if (color != null && !color.equals("auto")) span.append("color:#").append(color).append(';');
+        int sz = run.getFontSize();
+        if (sz > 0) span.append("font-size:").append(sz).append("pt;");
+
+        if (span.length() > 0) {
+            open.append("<span style='").append(span).append("'>");
+            close.insert(0, "</span>");
         }
-        
-        // Розмір шрифту
-        int fontSize = run.getFontSize();
-        if (fontSize > 0) {
-            styleAttr.append("font-size:").append(fontSize).append("pt;");
-            needsSpan = true;
-        }
-        
-        if (needsSpan) {
-            html.append("<span style='").append(styleAttr).append("'>");
-        }
-        
-        html.append(text);
-        
-        if (needsSpan) {
-            html.append("</span>");
-        }
-        
-        if (run.isStrikeThrough()) {
-            html.append("</s>");
-        }
-        
-        if (run.getUnderline() != UnderlinePatterns.NONE) {
-            html.append("</u>");
-        }
-        
-        if (run.isItalic()) {
-            html.append("</em>");
-        }
-        
-        if (run.isBold()) {
-            html.append("</strong>");
-        }
-        
-        return html.toString();
+        return open.toString() + text + close.toString();
     }
 
-    /**
-     * Конвертація таблиці в HTML
-     */
     private String tableToHtml(XWPFTable table) {
-        StringBuilder html = new StringBuilder("<table class='doc-table'>");
-        
-        for (XWPFTableRow row : table.getRows()) {
+        List<XWPFTableRow> rows = table.getRows();
+        if (rows.isEmpty()) {
+            return "<div class='table-wrap'><table class='doc-table'><tbody></tbody></table></div>";
+        }
+        StringBuilder html = new StringBuilder("<div class='table-wrap'><table class='doc-table'>");
+        html.append("<thead><tr>");
+        for (XWPFTableCell cell : rows.get(0).getTableCells()) {
+            html.append("<th class='doc-th'>");
+            for (XWPFParagraph cp : cell.getParagraphs()) {
+                String inner = paragraphInnerHtml(cp);
+                if (!inner.trim().isEmpty()) {
+                    html.append("<p class='doc-cell-p'>").append(inner).append("</p>");
+                }
+            }
+            html.append("</th>");
+        }
+        html.append("</tr></thead><tbody>");
+        for (int r = 1; r < rows.size(); r++) {
+            XWPFTableRow row = rows.get(r);
             html.append("<tr>");
             for (XWPFTableCell cell : row.getTableCells()) {
-                html.append("<td>");
-                for (XWPFParagraph paragraph : cell.getParagraphs()) {
-                    String text = paragraph.getText();
-                    if (!text.trim().isEmpty()) {
-                        // Для таблиць також використовуємо безпечне екранування
-                        if (text.contains("<") || text.contains(">")) {
-                            html.append(escapeHtmlSafe(text));
-                        } else {
-                            html.append(text);
-                        }
+                html.append("<td class='doc-td'>");
+                for (XWPFParagraph cp : cell.getParagraphs()) {
+                    String inner = paragraphInnerHtml(cp);
+                    if (!inner.trim().isEmpty()) {
+                        html.append("<p class='doc-cell-p'>").append(inner).append("</p>");
                     }
                 }
                 html.append("</td>");
             }
             html.append("</tr>");
         }
-        
-        html.append("</table>");
+        html.append("</tbody></table></div>");
         return html.toString();
     }
 
-    /**
-     * Читання PDF з рендерингом сторінок як зображень
-     */
-    private String readPdfAsHtml(Uri uri) throws Exception {
+    // =========================== DOC (legacy) ===========================
+
+    private String readDocAsHtml(Uri uri) throws Exception {
+        if (!FileValidator.isValidDoc(context, uri)) {
+            throw new IllegalStateException("Файл не є валідним DOC (OLE)");
+        }
         StringBuilder html = new StringBuilder();
-        
-        try (InputStream inputStream = context.getContentResolver().openInputStream(uri);
-             PDDocument document = PDDocument.load(inputStream)) {
-            
-            int pageCount = document.getNumberOfPages();
-            html.append("<div class='pdf-info'>");
-            html.append("<h3>📄 PDF документ</h3>");
-            html.append("<p>Сторінок: ").append(pageCount).append("</p>");
-            html.append("</div>");
-            
-            // Рендеринг перших кількох сторінок
-            PDFRenderer renderer = new PDFRenderer(document);
-            int maxPages = Math.min(10, pageCount); // Обмеження для продуктивності
-            
-            for (int i = 0; i < maxPages; i++) {
-                Bitmap bitmap = renderer.renderImage(i, 2.0f); // 2x якість
-                String base64 = bitmapToBase64(bitmap);
-                
-                html.append("<div class='pdf-page'>");
-                html.append("<p class='page-number'>Сторінка ").append(i + 1).append("</p>");
-                html.append("<img src='data:image/png;base64,").append(base64)
-                    .append("' class='pdf-page-image'/>");
-                html.append("</div>");
-                
-                bitmap.recycle();
-            }
-            
-            if (pageCount > maxPages) {
-                html.append("<div class='info'>Показано перші ")
-                    .append(maxPages).append(" з ").append(pageCount)
-                    .append(" сторінок</div>");
+        html.append("<article class='reader-doc reader-word'>");
+        html.append("<header class='reader-banner'><span class='reader-banner-label'>")
+            .append("Microsoft Word").append("</span></header>");
+        html.append("<div class='doc-body'><div class='doc-content doc-legacy'>");
+        try (InputStream is = context.getContentResolver().openInputStream(uri);
+             HWPFDocument doc = new HWPFDocument(is)) {
+
+            Range range = doc.getRange();
+            int n = range.numParagraphs();
+            for (int i = 0; i < n; i++) {
+                Paragraph p = range.getParagraph(i);
+                String t = p.text();
+                if (t == null) continue;
+                t = t.replace("\u0007", "").replace("\r", "").trim();
+                if (t.isEmpty()) {
+                    html.append("<br class='doc-br'/>");
+                } else {
+                    html.append("<p class='doc-p'>").append(escape(t)).append("</p>");
+                }
             }
         }
-        
+        html.append("</div></div></article>");
         return html.toString();
     }
 
-    /**
-     * Читання Excel з HTML таблицями
-     */
+    // =========================== Excel ===========================
+
     private String readXlsxAsHtml(Uri uri) throws Exception {
         StringBuilder html = new StringBuilder();
-        
-        try (InputStream inputStream = context.getContentResolver().openInputStream(uri);
-             XSSFWorkbook workbook = new XSSFWorkbook(inputStream)) {
-            
-            for (int i = 0; i < workbook.getNumberOfSheets(); i++) {
-                Sheet sheet = workbook.getSheetAt(i);
-                html.append("<div class='sheet'>");
-                String sheetName = sheet.getSheetName();
-                // Назву аркушу НЕ екрануємо якщо немає небезпечних символів
-                if (sheetName != null && (sheetName.contains("<") || sheetName.contains(">"))) {
-                    html.append("<h3>📊 ").append(escapeHtmlSafe(sheetName)).append("</h3>");
-                } else {
-                    html.append("<h3>📊 ").append(sheetName).append("</h3>");
-                }
-                html.append(sheetToHtml(sheet));
-                html.append("</div>");
+        try (InputStream is = context.getContentResolver().openInputStream(uri);
+             XSSFWorkbook wb = new XSSFWorkbook(is)) {
+            for (int i = 0; i < wb.getNumberOfSheets(); i++) {
+                Sheet s = wb.getSheetAt(i);
+                html.append("<section class='sheet'><h3>")
+                    .append(escape(s.getSheetName()))
+                    .append("</h3>")
+                    .append(sheetToHtml(s))
+                    .append("</section>");
             }
         }
-        
         return html.toString();
     }
 
     private String readXlsAsHtml(Uri uri) throws Exception {
         StringBuilder html = new StringBuilder();
-        
-        try (InputStream inputStream = context.getContentResolver().openInputStream(uri);
-             HSSFWorkbook workbook = new HSSFWorkbook(inputStream)) {
-            
-            for (int i = 0; i < workbook.getNumberOfSheets(); i++) {
-                Sheet sheet = workbook.getSheetAt(i);
-                html.append("<div class='sheet'>");
-                String sheetName = sheet.getSheetName();
-                // Назву аркушу НЕ екрануємо якщо немає небезпечних символів
-                if (sheetName != null && (sheetName.contains("<") || sheetName.contains(">"))) {
-                    html.append("<h3>📊 ").append(escapeHtmlSafe(sheetName)).append("</h3>");
-                } else {
-                    html.append("<h3>📊 ").append(sheetName).append("</h3>");
-                }
-                html.append(sheetToHtml(sheet));
-                html.append("</div>");
+        try (InputStream is = context.getContentResolver().openInputStream(uri);
+             HSSFWorkbook wb = new HSSFWorkbook(is)) {
+            for (int i = 0; i < wb.getNumberOfSheets(); i++) {
+                Sheet s = wb.getSheetAt(i);
+                html.append("<section class='sheet'><h3>")
+                    .append(escape(s.getSheetName()))
+                    .append("</h3>")
+                    .append(sheetToHtml(s))
+                    .append("</section>");
             }
         }
-        
         return html.toString();
     }
 
     private String sheetToHtml(Sheet sheet) {
         StringBuilder html = new StringBuilder("<table class='excel-table'>");
-        
         int maxCols = 0;
-        for (Row row : sheet) {
-            maxCols = Math.max(maxCols, row.getLastCellNum());
-        }
-        
+        for (Row row : sheet) maxCols = Math.max(maxCols, row.getLastCellNum());
+        boolean first = true;
         for (Row row : sheet) {
             html.append("<tr>");
             for (int i = 0; i < maxCols; i++) {
                 Cell cell = row.getCell(i);
-                html.append("<td>");
-                if (cell != null) {
-                    html.append(cellToHtml(cell));
-                }
-                html.append("</td>");
+                String tag = first ? "th" : "td";
+                html.append('<').append(tag).append('>');
+                if (cell != null) html.append(cellToHtml(cell));
+                html.append("</").append(tag).append('>');
             }
             html.append("</tr>");
+            first = false;
         }
-        
         html.append("</table>");
         return html.toString();
     }
 
     private String cellToHtml(Cell cell) {
-        CellType cellType = cell.getCellType();
-        
-        if (cellType == CellType.STRING) {
-            String value = cell.getStringCellValue();
-            // Для комірок також не екрануємо якщо немає небезпечних символів
-            if (value != null && (value.contains("<") || value.contains(">"))) {
-                return escapeHtmlSafe(value);
+        try {
+            CellType t = cell.getCellType();
+            if (t == CellType.STRING) return escape(cell.getStringCellValue());
+            if (t == CellType.BOOLEAN) return String.valueOf(cell.getBooleanCellValue());
+            if (t == CellType.FORMULA) return "<em>" + escape(cell.getCellFormula()) + "</em>";
+            if (t == CellType.NUMERIC) {
+                if (DateUtil.isCellDateFormatted(cell)) return cell.getDateCellValue().toString();
+                double v = cell.getNumericCellValue();
+                return v == (long) v ? String.valueOf((long) v) : String.format(Locale.US, "%.4f", v);
             }
-            return value;
-        } else if (cellType == CellType.NUMERIC) {
-            if (DateUtil.isCellDateFormatted(cell)) {
-                return cell.getDateCellValue().toString();
-            } else {
-                double value = cell.getNumericCellValue();
-                if (value == (long) value) {
-                    return String.valueOf((long) value);
-                } else {
-                    return String.format("%.2f", value);
-                }
-            }
-        } else if (cellType == CellType.BOOLEAN) {
-            return String.valueOf(cell.getBooleanCellValue());
-        } else if (cellType == CellType.FORMULA) {
-            return "<em>" + cell.getCellFormula() + "</em>";
-        }
-        
+        } catch (Exception ignored) {}
         return "";
     }
 
-    /**
-     * Читання текстових файлів
-     */
-    private String readTextAsHtml(Uri uri) throws Exception {
-        StringBuilder html = new StringBuilder("<pre class='text-content'>");
-        
-        try (InputStream inputStream = context.getContentResolver().openInputStream(uri);
-             BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream, StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                html.append(escapeHtml(line)).append("\n");
-            }
+    // =========================== PowerPoint ===========================
+
+    private String readPptxAsHtml(Uri uri) throws Exception {
+        if (!FileValidator.isValidPptx(context, uri)) {
+            throw new IllegalStateException("Файл не є валідним PPTX (немає ZIP-сигнатури)");
         }
-        
-        html.append("</pre>");
+        StringBuilder html = new StringBuilder();
+        html.append("<article class='reader-doc reader-slideshow'>");
+        html.append("<header class='reader-banner'><span class='reader-banner-label'>")
+            .append("PowerPoint").append("</span></header>");
+        try (InputStream is = context.getContentResolver().openInputStream(uri);
+             org.apache.poi.xslf.usermodel.XMLSlideShow ppt =
+                 new org.apache.poi.xslf.usermodel.XMLSlideShow(is)) {
+
+            List<org.apache.poi.xslf.usermodel.XSLFSlide> slides = ppt.getSlides();
+            html.append("<p class='deck-meta'>Слайдів: ").append(slides.size()).append("</p>");
+            html.append("<div class='slides-deck'>");
+            int idx = 1;
+            for (org.apache.poi.xslf.usermodel.XSLFSlide slide : slides) {
+                html.append("<section class='ppt-slide-card'>");
+                html.append("<div class='ppt-slide-meta'><span class='ppt-badge'>")
+                    .append(idx++).append("</span><span class='ppt-slide-title'>Слайд</span></div>");
+                html.append("<div class='ppt-slide-body'>");
+                boolean hasText = false;
+                try {
+                    org.openxmlformats.schemas.presentationml.x2006.main.CTSlide ct = slide.getXmlObject();
+                    if (ct != null && ct.getCSld() != null && ct.getCSld().getSpTree() != null
+                        && ct.getCSld().getSpTree().getSpList() != null) {
+                        for (org.openxmlformats.schemas.presentationml.x2006.main.CTShape sp
+                             : ct.getCSld().getSpTree().getSpList()) {
+                            if (sp.getTxBody() == null) continue;
+                            List<String> lines = txBodyParagraphLines(sp.getTxBody());
+                            StringBuilder shapeHtml = new StringBuilder();
+                            for (String line : lines) {
+                                if (line != null && !line.trim().isEmpty()) {
+                                    shapeHtml.append("<p class='ppt-line'>").append(escape(line))
+                                        .append("</p>");
+                                }
+                            }
+                            if (shapeHtml.length() > 0) {
+                                html.append("<div class='ppt-shape'>").append(shapeHtml).append("</div>");
+                                hasText = true;
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    html.append("<p class='error'>").append(escape(e.getMessage())).append("</p>");
+                }
+                if (!hasText) {
+                    html.append("<p class='ppt-empty'>На слайді немає тексту або він у непідтримуваних об'єктах ")
+                        .append("(діаграми, SmartArt тощо).</p>");
+                }
+                html.append("</div></section>");
+            }
+            html.append("</div>");
+        }
+        html.append("</article>");
         return html.toString();
     }
 
-    /**
-     * Читання JSON з підсвічуванням
-     */
-    private String readJsonAsHtml(Uri uri) throws Exception {
-        try (InputStream inputStream = context.getContentResolver().openInputStream(uri);
-             BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream, StandardCharsets.UTF_8))) {
-            
-            Gson gson = new GsonBuilder().setPrettyPrinting().create();
-            Object json = JsonParser.parseReader(reader);
-            String formatted = gson.toJson(json);
-            
-            return "<pre class='json-content'>" + escapeHtml(formatted) + "</pre>";
+    /** Окремі абзаци текстового блоку — зручніше стилізувати як «слайд». */
+    private static List<String> txBodyParagraphLines(
+            org.openxmlformats.schemas.drawingml.x2006.main.CTTextBody body) {
+        List<String> out = new ArrayList<>();
+        if (body == null) {
+            return out;
+        }
+        for (int i = 0; i < body.sizeOfPArray(); i++) {
+            org.openxmlformats.schemas.drawingml.x2006.main.CTTextParagraph p = body.getPArray(i);
+            if (p == null) continue;
+            StringBuilder sb = new StringBuilder();
+            for (int j = 0; j < p.sizeOfRArray(); j++) {
+                org.openxmlformats.schemas.drawingml.x2006.main.CTRegularTextRun r = p.getRArray(j);
+                if (r != null && r.getT() != null) sb.append(r.getT());
+            }
+            out.add(sb.toString());
+        }
+        return out;
+    }
+
+    private String readPptAsHtml(Uri uri) throws Exception {
+        if (!FileValidator.isValidPpt(context, uri)) {
+            throw new IllegalStateException("Файл не є валідним PPT (OLE)");
+        }
+        InputStream is = context.getContentResolver().openInputStream(uri);
+        if (is == null) {
+            throw new IllegalStateException("Не вдалося відкрити потік PPT");
+        }
+        PptLegacyRawTextExtractor ex = new PptLegacyRawTextExtractor(is);
+        try {
+            String raw = ex.getTextAsString();
+            if (raw == null) {
+                raw = "";
+            }
+            StringBuilder html = new StringBuilder();
+            html.append("<article class='reader-doc reader-slideshow'>");
+            html.append("<header class='reader-banner'><span class='reader-banner-label'>")
+                .append("PowerPoint").append("</span></header>");
+            html.append("<div class='info ppt-legacy-banner'><small>")
+                .append("Класичний .ppt: текст витягнуто без макета слайдів (порядок фрагментів може ")
+                .append("відрізнятися; можливі дублікати).</small></div>");
+            html.append("<div class='doc-body ppt-legacy-body'>");
+            String trimmed = raw.trim();
+            if (trimmed.isEmpty()) {
+                html.append("<p class='ppt-empty'>Текст не знайдено</p>");
+            } else {
+                for (String line : raw.split("\n")) {
+                    String t = line.trim();
+                    if (t.isEmpty()) {
+                        html.append("<br class='doc-br'/>");
+                    } else {
+                        html.append("<p class='doc-p ppt-legacy-line'>").append(escape(t)).append("</p>");
+                    }
+                }
+            }
+            html.append("</div></article>");
+            return html.toString();
+        } finally {
+            ex.close();
         }
     }
 
-    /**
-     * Читання XML з підсвічуванням
-     */
+    // =========================== Markdown ===========================
+
+    private String readMarkdownAsHtml(Uri uri) throws Exception {
+        // Якщо файл великий — fallback у моноширинний preview, інакше commonmark
+        // побудує величезний AST і впаде з OOM.
+        if (querySize(uri) > MAX_STRUCTURED_TEXT_BYTES / 2) {
+            return readTextAsHtml(uri);
+        }
+        String src = readAllTextSmall(uri);
+        List<Extension> exts = Arrays.asList(
+            TablesExtension.create(),
+            StrikethroughExtension.create(),
+            TaskListItemsExtension.create()
+        );
+        Parser parser = Parser.builder().extensions(exts).build();
+        HtmlRenderer renderer = HtmlRenderer.builder().extensions(exts).build();
+        return "<article class='markdown-body'>" + renderer.render(parser.parse(src)) + "</article>";
+    }
+
+    // =========================== CSV / TSV ===========================
+
+    private String readCsvAsHtml(Uri uri, char sep) throws Exception {
+        StringBuilder html = new StringBuilder("<table class='excel-table'>");
+        try (InputStream is = context.getContentResolver().openInputStream(uri);
+             InputStreamReader r = new InputStreamReader(is, StandardCharsets.UTF_8);
+             CSVReader csv = new com.opencsv.CSVReaderBuilder(r)
+                 .withCSVParser(new com.opencsv.CSVParserBuilder().withSeparator(sep).build())
+                 .build()) {
+
+            String[] line;
+            boolean first = true;
+            int row = 0;
+            while ((line = csv.readNext()) != null) {
+                row++;
+                if (row > 5000) {
+                    html.append("<tr><td colspan='99'><em>Показано перші 5000 рядків</em></td></tr>");
+                    break;
+                }
+                html.append("<tr>");
+                for (String c : line) {
+                    String tag = first ? "th" : "td";
+                    html.append('<').append(tag).append('>')
+                        .append(escape(c == null ? "" : c))
+                        .append("</").append(tag).append('>');
+                }
+                html.append("</tr>");
+                first = false;
+            }
+        }
+        html.append("</table>");
+        return html.toString();
+    }
+
+    // =========================== Text / JSON / XML / YAML ===========================
+
+    private String readTextAsHtml(Uri uri) throws Exception {
+        return "<pre class='text-content'>" + escape(readAllTextSmall(uri)) + "</pre>";
+    }
+
+    private String readJavaAsHtml(Uri uri) throws Exception {
+        String src = readAllTextSmall(uri);
+        return "<div class='info'>Java · підсвітка синтаксису</div>" +
+            "<pre class='text-content java-src'>" + JavaSyntaxHighlighter.highlightToHtml(src) + "</pre>";
+    }
+
+    private String readJsonAsHtml(Uri uri) throws Exception {
+        // Великі JSON-файли краще показати "як є" — без pretty-print парсингу,
+        // щоб не тримати в пам'яті ще й об'єктне дерево.
+        if (querySize(uri) > MAX_STRUCTURED_TEXT_BYTES) {
+            return readTextAsHtml(uri);
+        }
+        try (InputStream is = context.getContentResolver().openInputStream(uri);
+             BufferedReader r = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
+            Gson gson = new GsonBuilder().setPrettyPrinting().create();
+            Object o = JsonParser.parseReader(r);
+            return "<pre class='json-content'>" + escape(gson.toJson(o)) + "</pre>";
+        } catch (Exception e) {
+            // fallback: показати як plain text
+            return readTextAsHtml(uri);
+        }
+    }
+
+    private String readYamlAsHtml(Uri uri) throws Exception {
+        if (querySize(uri) > MAX_STRUCTURED_TEXT_BYTES) {
+            return readTextAsHtml(uri);
+        }
+        try (InputStream is = context.getContentResolver().openInputStream(uri)) {
+            Yaml yaml = new Yaml();
+            StringBuilder out = new StringBuilder();
+            for (Object doc : yaml.loadAll(is)) {
+                out.append(yamlToString(doc, 0)).append("\n---\n");
+            }
+            return "<pre class='json-content'>" + escape(out.toString()) + "</pre>";
+        } catch (Exception e) {
+            return readTextAsHtml(uri);
+        }
+    }
+
+    private String yamlToString(Object o, int indent) {
+        StringBuilder sb = new StringBuilder();
+        String pad = repeat("  ", indent);
+        if (o instanceof Map) {
+            for (Map.Entry<?, ?> e : ((Map<?, ?>) o).entrySet()) {
+                sb.append(pad).append(e.getKey()).append(":\n")
+                  .append(yamlToString(e.getValue(), indent + 1));
+            }
+        } else if (o instanceof Iterable) {
+            for (Object i : (Iterable<?>) o) {
+                sb.append(pad).append("- ").append(yamlToString(i, indent + 1).trim()).append('\n');
+            }
+        } else {
+            sb.append(pad).append(o).append('\n');
+        }
+        return sb.toString();
+    }
+
     private String readXmlAsHtml(Uri uri) throws Exception {
         return readTextAsHtml(uri);
     }
 
-    private String readDocAsHtml(Uri uri) throws Exception {
-        Log.d(TAG, "Читання DOC файлу (старий формат)...");
-        
-        StringBuilder html = new StringBuilder();
-        
-        try (InputStream inputStream = context.getContentResolver().openInputStream(uri);
-             HWPFDocument document = new HWPFDocument(inputStream)) {
-            
-            Log.d(TAG, "DOC документ відкрито успішно!");
-            
-            // Отримуємо текст з документа
-            Range range = document.getRange();
-            int numParagraphs = range.numParagraphs();
-            
-            Log.d(TAG, "Кількість параграфів: " + numParagraphs);
-            
-            html.append("<div class='doc-content'>");
-            html.append("<p class='info'>📄 DOC документ (старий формат Word)</p>");
-            
-            for (int i = 0; i < numParagraphs; i++) {
-                Paragraph para = range.getParagraph(i);
-                String text = para.text();
-                
-                // Логування першого параграфа для діагностики
-                if (i == 0 && !text.isEmpty()) {
-                    Log.d(TAG, "Перший параграф: [" + text + "]");
-                    Log.d(TAG, "Довжина: " + text.length());
-                    if (text.length() > 0) {
-                        Log.d(TAG, "Перший символ код: " + (int)text.charAt(0));
-                    }
-                }
-                
-                if (!text.trim().isEmpty()) {
-                    html.append("<p>");
-                    
-                    // НЕ екрануємо якщо немає небезпечних символів
-                    if (text.contains("<") || text.contains(">")) {
-                        html.append(escapeHtmlSafe(text));
-                    } else {
-                        html.append(text);
-                    }
-                    
-                    html.append("</p>");
-                } else {
-                    html.append("<br/>");
-                }
-            }
-            
-            html.append("</div>");
-            
-            return html.toString();
-            
-        } catch (Exception e) {
-            Log.e(TAG, "Помилка читання DOC", e);
-            return "<div class='error'>" +
-                   "<h2>❌ Помилка читання DOC</h2>" +
-                   "<p>" + e.getMessage() + "</p>" +
-                   "<p>Можливо файл пошкоджений або має неправильний формат</p>" +
-                   "</div>";
-        }
+    private String readHtmlPassthrough(Uri uri) throws Exception {
+        // Дозволяємо HTML, але видаляємо <script>
+        String src = readAllTextSmall(uri);
+        src = src.replaceAll("(?is)<script.*?</script>", "");
+        return src;
     }
 
     /**
-     * Читання PPTX презентації
+     * Читання невеликого тексту целиком (для файлів &lt; порогу потокового режиму в Activity).
      */
-    private String readPptxAsHtml(Uri uri) throws Exception {
-        Log.d(TAG, "Читання PPTX файлу...");
-        
-        StringBuilder html = new StringBuilder();
-        
-        try (InputStream inputStream = context.getContentResolver().openInputStream(uri);
-             org.apache.poi.xslf.usermodel.XMLSlideShow ppt = new org.apache.poi.xslf.usermodel.XMLSlideShow(inputStream)) {
-            
-            Log.d(TAG, "PPTX документ відкрито успішно!");
-            
-            List<org.apache.poi.xslf.usermodel.XSLFSlide> slides = ppt.getSlides();
-            
-            html.append("<div class='ppt-content'>");
-            html.append("<div class='info'>🎭 PowerPoint презентація (.pptx)</div>");
-            html.append("<p><strong>Кількість слайдів:</strong> ").append(slides.size()).append("</p>");
-            
-            Log.d(TAG, "Кількість слайдів: " + slides.size());
-            
-            int slideNum = 1;
-            for (org.apache.poi.xslf.usermodel.XSLFSlide slide : slides) {
-                html.append("<div class='ppt-slide'>");
-                html.append("<h3>📄 Слайд ").append(slideNum).append("</h3>");
-                
-                try {
-                    // Простіший підхід - витягуємо текст через getText() кожного shape окремо
-                    // Це уникає проблеми з AWT при ініціалізації всіх shapes одразу
-                    
-                    boolean hasText = false;
-                    org.openxmlformats.schemas.presentationml.x2006.main.CTSlide ctSlide = slide.getXmlObject();
-                    
-                    if (ctSlide != null && ctSlide.getCSld() != null && 
-                        ctSlide.getCSld().getSpTree() != null) {
-                        
-                        // Отримуємо XML shapes
-                        org.openxmlformats.schemas.presentationml.x2006.main.CTGroupShape spTree = 
-                            ctSlide.getCSld().getSpTree();
-                        
-                        // Обробляємо кожен shape окремо
-                        if (spTree.getSpList() != null) {
-                            for (int i = 0; i < spTree.getSpList().size(); i++) {
-                                try {
-                                    org.openxmlformats.schemas.presentationml.x2006.main.CTShape ctShape = 
-                                        spTree.getSpList().get(i);
-                                    
-                                    // Витягуємо текст з txBody
-                                    if (ctShape.getTxBody() != null) {
-                                        String shapeText = extractTextFromTxBody(ctShape.getTxBody());
-                                        if (shapeText != null && !shapeText.trim().isEmpty()) {
-                                            html.append("<p>");
-                                            if (shapeText.contains("<") || shapeText.contains(">")) {
-                                                html.append(escapeHtmlSafe(shapeText));
-                                            } else {
-                                                html.append(shapeText);
-                                            }
-                                            html.append("</p>");
-                                            hasText = true;
-                                        }
-                                    }
-                                } catch (Exception e) {
-                                    Log.w(TAG, "Пропуск shape " + i + ": " + e.getMessage());
-                                }
-                            }
-                        }
-                    }
-                    
-                    if (!hasText) {
-                        html.append("<p class='info'>Слайд без тексту (можливо тільки зображення або діаграми)</p>");
-                    }
-                    
-                } catch (Exception e) {
-                    html.append("<p class='error'>Помилка: ").append(e.getMessage()).append("</p>");
-                    Log.e(TAG, "Помилка читання слайду " + slideNum, e);
-                }
-                
-                html.append("</div>");
-                slideNum++;
-            }
-            
-            html.append("</div>");
-            
-            return html.toString();
-            
-        } catch (Exception e) {
-            Log.e(TAG, "Помилка читання PPTX", e);
-            return "<div class='error'>" +
-                   "<h2>❌ Помилка читання PPTX</h2>" +
-                   "<p>" + e.getMessage() + "</p>" +
-                   "<p>Можливо файл пошкоджений або має неправильний формат</p>" +
-                   "</div>";
-        }
-    }
-    
-    /**
-     * Витягування тексту з CTTextBody (без використання AWT)
-     */
-    private String extractTextFromTxBody(org.openxmlformats.schemas.drawingml.x2006.main.CTTextBody txBody) {
-        if (txBody == null) return "";
-        
-        StringBuilder text = new StringBuilder();
-        
-        try {
-            // Отримуємо всі параграфи
-            for (int i = 0; i < txBody.sizeOfPArray(); i++) {
-                org.openxmlformats.schemas.drawingml.x2006.main.CTTextParagraph para = txBody.getPArray(i);
-                
-                if (para != null) {
-                    // Отримуємо всі runs (текстові частини)
-                    for (int j = 0; j < para.sizeOfRArray(); j++) {
-                        org.openxmlformats.schemas.drawingml.x2006.main.CTRegularTextRun run = para.getRArray(j);
-                        
-                        if (run != null && run.getT() != null) {
-                            text.append(run.getT());
-                        }
-                    }
-                    
-                    // Якщо є текст, додаємо новий рядок після параграфа
-                    if (text.length() > 0 && i < txBody.sizeOfPArray() - 1) {
-                        text.append("\n");
-                    }
-                }
-            }
-        } catch (Exception e) {
-            Log.w(TAG, "Помилка витягування тексту з txBody: " + e.getMessage());
-        }
-        
-        return text.toString();
-    }
-    
-    /**
-     * Читання PPT презентації (старий формат)
-     */
-    private String readPptAsHtml(Uri uri) throws Exception {
-        Log.d(TAG, "Читання PPT файлу (старий формат)...");
-        
-        return "<div class='info'>" +
-               "<h3>🎭 PowerPoint презентація (.ppt)</h3>" +
-               "<p>Старий формат PPT має обмежену підтримку.</p>" +
-               "<p>Рекомендується конвертувати у PPTX для кращого відображення.</p>" +
-               "</div>";
-    }
-
-    private String readPlainText(Uri uri) throws Exception {
-        StringBuilder text = new StringBuilder();
-        try (InputStream inputStream = context.getContentResolver().openInputStream(uri);
-             BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream, StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                text.append(line).append("\n");
+    private String readAllTextSmall(Uri uri) throws Exception {
+        StringBuilder sb = new StringBuilder(8192);
+        try (InputStream is = context.getContentResolver().openInputStream(uri);
+             BufferedReader r = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
+            char[] buf = new char[16 * 1024];
+            int n;
+            while ((n = r.read(buf)) != -1) {
+                sb.append(buf, 0, n);
             }
         }
-        return text.toString();
+        return sb.toString();
     }
 
-    /**
-     * Обгортка HTML з CSS стилями
-     */
-    private String wrapHtml(String content, String fileName) {
-        return "<!DOCTYPE html>" +
-                "<html><head>" +
-                "<meta http-equiv='Content-Type' content='text/html; charset=UTF-8'>" +
-                "<meta charset='UTF-8'>" +
-                "<meta name='viewport' content='width=device-width, initial-scale=1.0, user-scalable=yes'>" +
-                "<title>" + escapeHtml(fileName) + "</title>" +
-                "<style>" + getCss() + "</style>" +
-                "</head><body>" +
-                "<div class='container'>" +
-                content +
-                "</div>" +
-                "</body></html>";
+    /** Повертає розмір файлу через ContentResolver, або -1 якщо невідомо. */
+    private long querySize(Uri uri) {
+        return queryOpenableSize(context, uri);
     }
 
-    /**
-     * CSS стилі для документа
-     */
-    private String getCss() {
-        return
-                "body { margin: 0; padding: 16px; font-family: 'Roboto', sans-serif; line-height: 1.6; color: #333; background: #f5f5f5; }" +
-                ".container { max-width: 900px; margin: 0 auto; background: white; padding: 24px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }" +
-                "h1, h2, h3, h4, h5, h6 { color: #1976D2; margin-top: 24px; margin-bottom: 12px; font-weight: 600; }" +
-                "h1 { font-size: 2em; border-bottom: 3px solid #1976D2; padding-bottom: 8px; }" +
-                "h2 { font-size: 1.75em; border-bottom: 2px solid #1976D2; padding-bottom: 6px; }" +
-                "h3 { font-size: 1.5em; }" +
-                "p { margin: 12px 0; text-align: justify; }" +
-                "strong { font-weight: 700; color: #000; }" +
-                "em { font-style: italic; }" +
-                "u { text-decoration: underline; }" +
-                ".doc-table, .excel-table { width: 100%; border-collapse: collapse; margin: 16px 0; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }" +
-                ".doc-table td, .excel-table td, .doc-table th, .excel-table th { border: 1px solid #ddd; padding: 12px; text-align: left; }" +
-                ".doc-table tr:nth-child(even), .excel-table tr:nth-child(even) { background-color: #f9f9f9; }" +
-                ".doc-table tr:hover, .excel-table tr:hover { background-color: #e3f2fd; }" +
-                ".doc-image { max-width: 100%; height: auto; margin: 16px auto; display: block; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.15); }" +
-                ".inline-image { margin: 8px 0; }" +
-                ".image-container { margin: 16px 0; text-align: center; }" +
-                ".image-caption { font-weight: 600; color: #1976D2; margin-bottom: 8px; font-size: 14px; }" +
-                ".images-section { margin-top: 32px; padding-top: 24px; border-top: 2px solid #e0e0e0; }" +
-                ".pdf-page { margin: 24px 0; padding: 16px; background: #fafafa; border-radius: 8px; }" +
-                ".pdf-page-image { width: 100%; height: auto; border: 1px solid #ddd; border-radius: 4px; }" +
-                ".page-number { font-weight: 600; color: #1976D2; margin-bottom: 8px; }" +
-                ".pdf-info { background: #e3f2fd; padding: 16px; border-radius: 8px; margin-bottom: 24px; }" +
-                ".sheet { margin-bottom: 32px; }" +
-                ".text-content { background: #f5f5f5; padding: 16px; border-radius: 8px; overflow-x: auto; font-family: 'Courier New', monospace; font-size: 14px; line-height: 1.4; }" +
-                ".json-content { background: #263238; color: #aed581; padding: 16px; border-radius: 8px; overflow-x: auto; font-family: 'Courier New', monospace; font-size: 14px; }" +
-                ".info { background: #e8f5e9; color: #2e7d32; padding: 16px; border-radius: 8px; border-left: 4px solid #4caf50; margin: 16px 0; }" +
-                ".error { background: #ffebee; color: #c62828; padding: 16px; border-radius: 8px; border-left: 4px solid #f44336; margin: 16px 0; }" +
-                ".error-detail { font-family: monospace; font-size: 12px; margin-top: 8px; opacity: 0.8; }" +
-                ".doc-content { margin: 16px 0; }" +
-                ".doc-content p { margin: 8px 0; line-height: 1.6; }" +
-                ".ppt-content { margin: 16px 0; }" +
-                ".ppt-slide { background: #fff; border: 2px solid #1976D2; border-radius: 8px; padding: 20px; margin: 16px 0; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }" +
-                ".ppt-slide h3 { color: #1976D2; margin-top: 0; border-bottom: 2px solid #1976D2; padding-bottom: 8px; }" +
-                ".ppt-slide p { margin: 12px 0; font-size: 16px; line-height: 1.8; }" +
-                "pre { white-space: pre-wrap; word-wrap: break-word; }";
-    }
+    // =========================== Helpers ===========================
 
-    // Допоміжні методи
-    
-    private String getAlignment(ParagraphAlignment alignment) {
-        if (alignment == null) return "left";
-        switch (alignment) {
+    private String alignment(ParagraphAlignment a) {
+        if (a == null) return "left";
+        switch (a) {
             case CENTER: return "center";
-            case RIGHT: return "right";
-            case BOTH: return "justify";
-            default: return "left";
+            case RIGHT:  return "right";
+            case BOTH:   return "justify";
+            default:     return "left";
         }
     }
 
     private int extractHeadingLevel(String style) {
         if (style == null) return 3;
-        if (style.toLowerCase().contains("heading1")) return 1;
-        if (style.toLowerCase().contains("heading2")) return 2;
-        if (style.toLowerCase().contains("heading3")) return 3;
-        if (style.toLowerCase().contains("heading4")) return 4;
+        String s = style.toLowerCase(Locale.ROOT);
+        if (s.contains("title") && !s.contains("subtitle")) {
+            return 1;
+        }
+        for (int i = 1; i <= 6; i++) if (s.contains("heading" + i)) return i;
         return 3;
     }
 
-    private String encodeImageToBase64(byte[] imageData) {
-        return Base64.encodeToString(imageData, Base64.NO_WRAP);
-    }
-
-    private String bitmapToBase64(Bitmap bitmap) {
-        ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
-        bitmap.compress(Bitmap.CompressFormat.PNG, 90, byteArrayOutputStream);
-        byte[] byteArray = byteArrayOutputStream.toByteArray();
-        return Base64.encodeToString(byteArray, Base64.NO_WRAP);
-    }
-
-    /**
-     * Безпечне екранування HTML для UTF-8 тексту
-     */
-    private String escapeHtmlSafe(String text) {
+    private String escape(String text) {
         if (text == null) return "";
-        
-        // Використовуємо StringBuilder для збереження UTF-8
-        StringBuilder result = new StringBuilder(text.length() + 50);
-        
+        StringBuilder out = new StringBuilder(text.length() + 16);
         for (int i = 0; i < text.length(); i++) {
-            char ch = text.charAt(i);
-            
-            // Екрануємо ТІЛЬКИ небезпечні для HTML символи
-            switch (ch) {
-                case '<':
-                    result.append("&lt;");
-                    break;
-                case '>':
-                    result.append("&gt;");
-                    break;
-                case '&':
-                    result.append("&amp;");
-                    break;
-                case '"':
-                    result.append("&quot;");
-                    break;
-                default:
-                    // Всі інші символи, включаючи кирилицю, залишаємо
-                    result.append(ch);
+            char c = text.charAt(i);
+            switch (c) {
+                case '<':  out.append("&lt;");   break;
+                case '>':  out.append("&gt;");   break;
+                case '&':  out.append("&amp;");  break;
+                case '"':  out.append("&quot;"); break;
+                default:   out.append(c);
             }
         }
-        
-        return result.toString();
-    }
-    
-    /**
-     * Старий метод для сумісності
-     */
-    private String escapeHtml(String text) {
-        return escapeHtmlSafe(text);
+        return out.toString();
     }
 
     private String getFileExtension(String fileName) {
-        if (fileName != null && fileName.contains(".")) {
-            return fileName.substring(fileName.lastIndexOf(".") + 1);
-        }
-        return "";
+        if (fileName == null) return "";
+        int i = fileName.lastIndexOf('.');
+        return i < 0 ? "" : fileName.substring(i + 1);
+    }
+
+    private String repeat(String s, int n) {
+        StringBuilder sb = new StringBuilder(s.length() * Math.max(0, n));
+        for (int i = 0; i < n; i++) sb.append(s);
+        return sb.toString();
+    }
+
+    // =========================== HTML wrapper / CSS ===========================
+
+    private String wrapHtml(String content, String fileName) {
+        return "<!DOCTYPE html><html><head>" +
+               "<meta charset='UTF-8'>" +
+               "<meta name='viewport' content='width=device-width, initial-scale=1.0, user-scalable=yes'>" +
+               "<title>" + escape(fileName == null ? "" : fileName) + "</title>" +
+               "<style>" + getDocumentCss() + "</style>" +
+               "</head><body class='theme-light'>" +
+               "<main class='container'>" + content + "</main>" +
+               "</body></html>";
+    }
+
+    public static String getDocumentCss() {
+        return
+          ":root{--bg:#f5f5f5;--surface:#fff;--text:#222;--muted:#666;--accent:#1976D2;--border:#e0e0e0;}" +
+          "body.theme-dark{--bg:#121212;--surface:#1e1e1e;--text:#eaeaea;--muted:#aaa;--accent:#64b5f6;--border:#333;}" +
+          "html,body{margin:0;padding:0;background:var(--bg);color:var(--text);" +
+          "font-family:-apple-system,Roboto,'Helvetica Neue',Arial,sans-serif;line-height:1.6;-webkit-text-size-adjust:100%;}" +
+          ".container{max-width:min(920px,100%);margin:0 auto;padding:20px;background:var(--surface);" +
+          "border-radius:12px;box-shadow:0 2px 14px rgba(0,0,0,0.08);}" +
+          ".reader-doc{--reader-serif:Georgia,'Noto Serif',ui-serif,serif;--reader-sans:-apple-system,BlinkMacSystemFont,Roboto,'Segoe UI',sans-serif;}" +
+          ".reader-word,.reader-slideshow{font-family:var(--reader-sans);font-size:clamp(16px,2.9vw,18px);" +
+          "line-height:1.75;color:var(--text);text-rendering:optimizeLegibility;-webkit-font-smoothing:antialiased;}" +
+          ".reader-banner{display:flex;align-items:center;gap:10px;margin:-20px -20px 16px -20px;padding:16px 20px 18px;" +
+          "background:linear-gradient(135deg,rgba(25,118,210,0.14),rgba(25,118,210,0.04));" +
+          "border-bottom:1px solid var(--border);border-radius:12px 12px 0 0;}" +
+          "body.theme-dark .reader-banner{background:linear-gradient(135deg,rgba(100,181,246,0.12),rgba(30,30,30,0.9));}" +
+          ".reader-banner-label{font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:var(--accent);}" +
+          ".reader-word .doc-body,.reader-slideshow .doc-body{padding:0;}" +
+          ".reader-word .doc-p,.reader-word .doc-li,.reader-word .doc-cell-p{font-family:var(--reader-serif);}" +
+          ".doc-body .doc-p{margin:0 0 1em;line-height:1.8;}" +
+          ".doc-body .doc-heading{font-family:var(--reader-sans);margin:1.35em 0 0.55em;line-height:1.25;}" +
+          ".doc-body .doc-heading:first-child{margin-top:0.3em;}" +
+          ".doc-list{margin:0.6em 0 1em;padding-inline-start:1.35em;}" +
+          ".doc-list .doc-li{margin:0.35em 0;line-height:1.7;}" +
+          ".doc-sdt{margin:12px 0;padding:12px 14px;background:rgba(0,0,0,0.03);border-radius:8px;border:1px dashed var(--border);}" +
+          "body.theme-dark .doc-sdt{background:rgba(255,255,255,0.04);}" +
+          ".table-wrap{overflow-x:auto;margin:1.25em 0;border-radius:10px;border:1px solid var(--border);" +
+          "background:var(--surface);box-shadow:0 1px 5px rgba(0,0,0,0.05);}" +
+          ".table-wrap .doc-table{margin:0;}" +
+          ".doc-th{background:rgba(25,118,210,0.1);font-weight:600;font-family:var(--reader-sans);}" +
+          "body.theme-dark .doc-th{background:rgba(100,181,246,0.12);}" +
+          ".doc-cell-p{margin:0.25em 0;line-height:1.55;}" +
+          ".deck-meta{margin:0 0 10px;color:var(--muted);font-size:0.95em;}" +
+          ".slides-deck{display:flex;flex-direction:column;gap:22px;padding:4px 0 8px;}" +
+          ".ppt-slide-card{border:1px solid var(--border);border-radius:14px;overflow:hidden;" +
+          "background:linear-gradient(180deg,var(--surface) 0%,rgba(0,0,0,0.02) 100%);" +
+          "box-shadow:0 6px 20px rgba(0,0,0,0.07);}" +
+          "body.theme-dark .ppt-slide-card{box-shadow:0 6px 24px rgba(0,0,0,0.35);" +
+          "background:linear-gradient(180deg,#1e1e1e,#252525);}" +
+          ".ppt-slide-meta{display:flex;align-items:center;gap:12px;padding:12px 18px;" +
+          "background:rgba(25,118,210,0.09);border-bottom:1px solid var(--border);}" +
+          "body.theme-dark .ppt-slide-meta{background:rgba(100,181,246,0.08);}" +
+          ".ppt-slide-title{font-size:0.85em;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;}" +
+          ".ppt-badge{display:inline-flex;align-items:center;justify-content:center;min-width:30px;height:30px;" +
+          "padding:0 10px;border-radius:999px;background:var(--accent);color:#fff;font-weight:700;font-size:13px;}" +
+          ".ppt-slide-body{padding:20px 22px 26px;}" +
+          ".ppt-shape{margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid rgba(0,0,0,0.06);}" +
+          ".ppt-shape:last-child{border-bottom:none;margin-bottom:0;padding-bottom:0;}" +
+          "body.theme-dark .ppt-shape{border-bottom-color:rgba(255,255,255,0.08);}" +
+          ".ppt-line{margin:0 0 12px;font-size:1.06em;line-height:1.65;font-family:var(--reader-serif);}" +
+          ".ppt-line:last-child{margin-bottom:0;}" +
+          ".ppt-empty,.ppt-legacy-line{color:var(--muted);}" +
+          ".ppt-legacy-banner{margin:12px 0;}" +
+          ".ppt-legacy-body{padding:4px 0 0;}" +
+          "h1,h2,h3,h4,h5,h6{color:var(--accent);margin:24px 0 12px;font-weight:600;}" +
+          "h1{font-size:1.8em;border-bottom:3px solid var(--accent);padding-bottom:8px;}" +
+          "h2{font-size:1.5em;border-bottom:2px solid var(--accent);padding-bottom:6px;}" +
+          "h3{font-size:1.25em;}" +
+          "p{margin:12px 0;}" +
+          "a{color:var(--accent);}" +
+          "strong{font-weight:700;}" +
+          "em{font-style:italic;}" +
+          "u{text-decoration:underline;}" +
+          ".doc-table,.excel-table{width:100%;border-collapse:collapse;margin:0;font-size:0.95em;}" +
+          ".doc-table td,.doc-table th,.excel-table td,.excel-table th{" +
+              "border:1px solid var(--border);padding:10px 14px;text-align:left;vertical-align:top;}" +
+          ".excel-table th{background:rgba(25,118,210,0.08);font-weight:600;}" +
+          ".doc-table tbody tr:nth-child(even),.excel-table tr:nth-child(even){background:rgba(0,0,0,0.03);}" +
+          "body.theme-dark .doc-table tbody tr:nth-child(even){background:rgba(255,255,255,0.03);}" +
+          ".doc-image{max-width:100%;height:auto;margin:12px auto;display:block;border-radius:6px;}" +
+          ".inline-image{display:inline-block;margin:4px 8px;}" +
+          ".images-section{margin-top:32px;padding-top:24px;border-top:1px solid var(--border);}" +
+          "figure{margin:16px 0;text-align:center;}figcaption{color:var(--muted);font-size:0.85em;margin-top:4px;}" +
+          ".sheet{margin-bottom:24px;}" +
+          ".text-content,.json-content{background:rgba(0,0,0,0.04);padding:14px;border-radius:6px;" +
+              "overflow-x:auto;font-family:'Courier New',monospace;font-size:13px;line-height:1.45;}" +
+          "body.theme-dark .json-content{background:#0d1117;color:#a5d6a7;}" +
+          ".info{background:rgba(76,175,80,0.12);color:#2e7d32;padding:12px 14px;border-left:4px solid #4caf50;border-radius:4px;margin:12px 0;}" +
+          "body.theme-dark .info{color:#a5d6a7;}" +
+          ".error{background:rgba(244,67,54,0.10);color:#c62828;padding:12px 14px;border-left:4px solid #f44336;border-radius:4px;margin:12px 0;}" +
+          "body.theme-dark .error{color:#ef9a9a;}" +
+          ".ppt-slide{border:1px solid var(--border);border-radius:8px;padding:16px;margin:16px 0;background:var(--surface);}" +
+          ".ppt-slide h3{margin-top:0;}" +
+          ".epub-meta{margin-bottom:24px;padding-bottom:16px;border-bottom:2px solid var(--border);}" +
+          ".epub-title{margin:0 0 8px;font-size:1.6em;}" +
+          ".epub-author{color:var(--muted);}" +
+          ".epub-chapter{margin:24px 0;padding-top:16px;border-top:1px dashed var(--border);}" +
+          ".markdown-body code{background:rgba(0,0,0,0.05);padding:2px 6px;border-radius:4px;font-family:'Courier New',monospace;}" +
+          ".markdown-body pre{background:rgba(0,0,0,0.05);padding:12px;border-radius:6px;overflow-x:auto;}" +
+          ".markdown-body blockquote{border-left:4px solid var(--accent);padding-left:12px;color:var(--muted);margin:12px 0;}" +
+          "pre{white-space:pre-wrap;word-wrap:break-word;}" +
+          "img{max-width:100%;height:auto;}" +
+          ".java-src{font-family:'JetBrains Mono','Fira Code','Courier New',monospace;font-size:13px;line-height:1.45;}" +
+          ".java-kw{color:#1565C0;font-weight:600;}" +
+          ".java-str{color:#2E7D32;}" +
+          ".java-com{color:#6A1B9A;font-style:italic;}" +
+          ".java-ann{color:#C62828;}" +
+          ".java-num{color:#E65100;}" +
+          "body.theme-dark .java-kw{color:#90CAF9;}" +
+          "body.theme-dark .java-str{color:#A5D6A7;}" +
+          "body.theme-dark .java-com{color:#CE93D8;}" +
+          "body.theme-dark .java-ann{color:#FFAB91;}" +
+          "body.theme-dark .java-num{color:#FFCC80;}";
     }
 }
-

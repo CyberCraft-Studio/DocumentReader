@@ -1,20 +1,61 @@
 <resources>
     <string name="app_name">Document Reader</string>
-    <string name="select_document">Select a document to read</string>
-    <string name="open_document">Open Document</string>
-    <string name="loading">Loading…</string>
-    <string name="content_placeholder">Document content will appear here…</string>
-    <string name="permission_granted">Permission granted</string>
-    <string name="permission_denied">Permission denied. Some features may not work.</string>
-    <string name="document_loaded">Document loaded</string>
-    <string name="loading_error">Loading error</string>
-    <string name="install_file_manager">Please install a file manager</string>
-    <string name="document_viewer">Document Viewer</string>
-    <string name="choose_file">Choose file to view</string>
-    <string name="features">Features:</string>
-    <string name="feature_formatting">✓ Text formatting (bold, italic)</string>
-    <string name="feature_images">✓ Images from documents</string>
-    <string name="feature_tables">✓ Tables with styles</string>
-    <string name="feature_pdf">✓ PDF as images</string>
-    <string name="feature_zoom">✓ Document zoom</string>
+
+    <!-- Main screen -->
+    <string name="select_document">Виберіть документ для читання</string>
+    <string name="open_document">Відкрити документ</string>
+    <string name="recent_files">Недавні файли</string>
+    <string name="no_recent_files">Тут буде список нещодавно відкритих документів</string>
+    <string name="clear_recent">Очистити список</string>
+    <string name="clear_recent_confirm">Прибрати всі записи з історії?</string>
+    <string name="about">Про застосунок</string>
+    <string name="about_text">Швидкий читач документів: DOC/DOCX, PPT/PPTX, PDF, TXT, EPUB, таблиці Excel, Markdown, CSV, JSON, YAML, RTF та інше. Без реклами, без трекерів, з темною темою та пошуком по тексту.</string>
+
+    <!-- Permissions -->
+    <string name="permission_granted">Дозвіл надано</string>
+    <string name="permission_denied">Дозвіл відхилено. Деякі функції можуть не працювати.</string>
+    <string name="install_file_manager">Встановіть файловий менеджер</string>
+
+    <!-- Viewer -->
+    <string name="document_viewer">Перегляд документа</string>
+    <string name="document_loaded">Документ завантажено</string>
+    <string name="loading_error">Помилка завантаження</string>
+    <string name="loading">Завантаження…</string>
+    <string name="search">Пошук</string>
+    <string name="search_hint">Пошук у документі…</string>
+    <string name="search_previous">Попереднє</string>
+    <string name="search_next">Наступне</string>
+    <string name="search_close">Закрити пошук</string>
+    <string name="search_not_found">Нічого не знайдено</string>
+    <string name="zoom_in">Збільшити</string>
+    <string name="zoom_out">Зменшити</string>
+    <string name="dark_mode">Темна тема</string>
+    <string name="share">Поділитися</string>
+    <string name="remove">Видалити</string>
+
+    <!-- PDF -->
+    <string name="pdf_first_page">До першої сторінки</string>
+    <string name="pdf_last_page">До останньої сторінки</string>
+    <string name="pdf_page_label">Сторінка %1$d</string>
+    <string name="pdf_page_indicator">%1$d / %2$d</string>
+    <string name="pdf_page_error">Сторінка %1$d: помилка %2$s</string>
+    <string name="pdf_open_failed">Не вдалося відкрити PDF</string>
+
+    <!-- Features list -->
+    <string name="features">Можливості:</string>
+    <string name="feature_formatting">✓ Форматування тексту (жирний, курсив)</string>
+    <string name="feature_images">✓ Зображення з документів</string>
+    <string name="feature_tables">✓ Таблиці зі стилями</string>
+    <string name="feature_pdf">✓ Швидкий PDF (нативний рендеринг)</string>
+    <string name="feature_zoom">✓ Плавне масштабування</string>
+    <string name="feature_search">✓ Пошук по тексту</string>
+    <string name="feature_dark_mode">✓ Темна тема</string>
+    <string name="feature_epub">✓ EPUB з обкладинкою та зображеннями</string>
+    <string name="feature_office_txt">✓ Word (DOC, DOCX), PowerPoint (PPT, PPTX), PDF, TXT</string>
+
+    <!-- Misc -->
+    <string name="content_placeholder">Вміст документа з\'явиться тут…</string>
+    <string name="choose_file">Виберіть файл для перегляду</string>
+    <string name="stream_end_reached">Кінець файлу (усі блоки завантажено)</string>
+    <string name="epub_end_reached">Кінець книги (усі розділи завантажено)</string>
 </resources>

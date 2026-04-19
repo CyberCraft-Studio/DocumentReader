@@ -10,10 +10,13 @@ android {
         applicationId "com.ccs.documentreader"
         minSdk 26
         targetSdk 34
-        versionCode 1
-        versionName "1.0"
+        versionCode 2
+        versionName "2.0"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+
+        // Apache POI / commons-compress тягнуть багато класів — multidex для безпеки
+        multiDexEnabled true
     }
 
     buildTypes {
@@ -26,10 +29,26 @@ android {
         sourceCompatibility JavaVersion.VERSION_11
         targetCompatibility JavaVersion.VERSION_11
     }
-    
+
+    buildFeatures {
+        viewBinding true
+    }
+
     packagingOptions {
         resources {
-            excludes += ['META-INF/NOTICE', 'META-INF/LICENSE', 'META-INF/DEPENDENCIES']
+            excludes += [
+                'META-INF/NOTICE',
+                'META-INF/NOTICE.txt',
+                'META-INF/NOTICE.md',
+                'META-INF/LICENSE',
+                'META-INF/LICENSE.txt',
+                'META-INF/LICENSE.md',
+                'META-INF/DEPENDENCIES',
+                'META-INF/INDEX.LIST',
+                'META-INF/*.kotlin_module',
+                'META-INF/versions/9/OSGI-INF/MANIFEST.MF'
+            ]
+            pickFirsts += ['META-INF/services/javax.xml.stream.XMLInputFactory']
         }
     }
 }
@@ -40,39 +59,38 @@ dependencies {
     implementation libs.material
     implementation libs.activity
     implementation libs.constraintlayout
-    
+    implementation 'androidx.recyclerview:recyclerview:1.3.2'
+    implementation 'androidx.swiperefreshlayout:swiperefreshlayout:1.1.0'
+
     // Apache POI для Word, Excel, PowerPoint
     implementation 'org.apache.poi:poi:5.2.3'
     implementation 'org.apache.poi:poi-ooxml:5.2.3'
     implementation 'org.apache.poi:poi-scratchpad:5.2.3'
-    
-    // PDF читання
+
+    // PDF читання (запасне; основне рендериться через android.graphics.pdf)
     implementation 'com.tom-roush:pdfbox-android:2.0.27.0'
-    
-    // Markdown
-    implementation 'io.noties.markwon:core:4.6.2'
-    
+
+    // Markdown -> HTML (легкий парсер commonmark)
+    implementation 'org.commonmark:commonmark:0.21.0'
+    implementation 'org.commonmark:commonmark-ext-gfm-tables:0.21.0'
+    implementation 'org.commonmark:commonmark-ext-gfm-strikethrough:0.21.0'
+    implementation 'org.commonmark:commonmark-ext-task-list-items:0.21.0'
+
     // JSON парсинг
     implementation 'com.google.code.gson:gson:2.10.1'
-    
-    // XML парсинг
-    implementation 'org.simpleframework:simple-xml:2.7.1'
-    
-    // EPUB читання - тимчасово вимкнено через недоступність в Maven Central
-    // implementation 'nl.siegmann.epublib:epublib-core:3.1'
-    
-    // Архіви (ZIP, RAR тощо)
+
+    // Архіви (ZIP, TAR, GZ, XZ) — також потрібно для EPUB
     implementation 'org.apache.commons:commons-compress:1.24.0'
-    
+
     // RTF підтримка
     implementation 'com.github.joniles:rtfparserkit:1.16.0'
-    
+
     // CSV підтримка
     implementation 'com.opencsv:opencsv:5.8'
-    
+
     // YAML підтримка
     implementation 'org.yaml:snakeyaml:2.2'
-    
+
     testImplementation libs.junit
     androidTestImplementation libs.ext.junit
     androidTestImplementation libs.espresso.core

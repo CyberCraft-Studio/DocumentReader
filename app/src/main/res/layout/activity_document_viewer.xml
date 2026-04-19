@@ -7,7 +7,6 @@
     android:orientation="vertical"
     tools:context=".DocumentViewerActivity">
 
-    <!-- Toolbar -->
     <com.google.android.material.appbar.MaterialToolbar
         android:id="@+id/toolbar"
         android:layout_width="match_parent"
@@ -15,10 +14,55 @@
         android:background="?attr/colorPrimary"
         android:elevation="4dp"
         app:titleTextColor="@android:color/white"
-        app:navigationIcon="@drawable/ic_arrow_back"
-        app:title="@string/document_viewer" />
+        app:navigationIcon="@drawable/ic_arrow_back" />
 
-    <!-- Progress Bar -->
+    <LinearLayout
+        android:id="@+id/searchBar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:padding="6dp"
+        android:gravity="center_vertical"
+        android:background="?attr/colorSurface"
+        android:elevation="2dp"
+        android:visibility="gone">
+
+        <EditText
+            android:id="@+id/searchInput"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:hint="@string/search_hint"
+            android:imeOptions="actionSearch"
+            android:inputType="text"
+            android:singleLine="true"
+            android:padding="8dp" />
+
+        <ImageButton
+            android:id="@+id/btnSearchPrev"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:src="@android:drawable/arrow_up_float"
+            android:contentDescription="@string/search_previous" />
+
+        <ImageButton
+            android:id="@+id/btnSearchNext"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:src="@android:drawable/arrow_down_float"
+            android:contentDescription="@string/search_next" />
+
+        <ImageButton
+            android:id="@+id/btnSearchClose"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:src="@android:drawable/ic_menu_close_clear_cancel"
+            android:contentDescription="@string/search_close" />
+    </LinearLayout>
+
     <ProgressBar
         android:id="@+id/progressBar"
         style="?android:attr/progressBarStyleHorizontal"
@@ -27,7 +71,6 @@
         android:indeterminate="true"
         android:visibility="gone" />
 
-    <!-- WebView for rich document display -->
     <WebView
         android:id="@+id/webView"
         android:layout_width="match_parent"
@@ -36,49 +79,4 @@
         android:background="@android:color/white"
         android:scrollbars="vertical" />
 
-    <!-- Bottom controls -->
-    <LinearLayout
-        android:id="@+id/bottomControls"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:padding="8dp"
-        android:gravity="center"
-        android:background="?attr/colorSurface"
-        android:elevation="4dp">
-
-        <Button
-            android:id="@+id/btnZoomOut"
-            style="?attr/materialButtonOutlinedStyle"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:layout_marginEnd="4dp"
-            android:text="A-"
-            android:textSize="16sp" />
-
-        <Button
-            android:id="@+id/btnZoomReset"
-            style="?attr/materialButtonOutlinedStyle"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:layout_marginStart="4dp"
-            android:layout_marginEnd="4dp"
-            android:text="100%"
-            android:textSize="14sp" />
-
-        <Button
-            android:id="@+id/btnZoomIn"
-            style="?attr/materialButtonOutlinedStyle"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:layout_marginStart="4dp"
-            android:text="A+"
-            android:textSize="16sp" />
-
-    </LinearLayout>
-
 </LinearLayout>
-
